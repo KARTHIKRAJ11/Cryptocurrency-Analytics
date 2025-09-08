@@ -108,3 +108,5 @@ Notifications: Add a feature to send email or Slack notifications on pipeline su
 Monitoring: Integrate with a monitoring service like GCP Cloud Monitoring to track pipeline performance and resource usage.
 
 Parameterized Queries: Modify the pipeline to fetch a configurable list of cryptocurrencies instead of hardcoding them.
+
+Reporting : Integrate with looker studio for creating Dashboards for Data Visualization.
