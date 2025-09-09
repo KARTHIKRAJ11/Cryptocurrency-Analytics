@@ -2,7 +2,10 @@ import os
 import requests
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from google.api_core import exceptions
 import logging
+from datetime import datetime
+import time
 
 PROJECT_ID = 'core-onelms-poc'
 DATASET_ID = 'crypto_data_pipeline'
@@ -35,47 +38,80 @@ def fetch_api_data(api_url):
     logging.info(f"Fetching data from API: {api_url}")
     try:
         response = requests.get(api_url)
-        response.raise_for_status()
+        response.raise_for_status() 
         data = response.json()
-        rows_to_insert = [
-            {'currency_id': 'bitcoin', 'price_usd': data.get('bitcoin', {}).get('usd')},
-            {'currency_id': 'ethereum', 'price_usd': data.get('ethereum', {}).get('usd')}
-        ]
-        return rows_to_insert
+        logging.info("Data fetched successfully.")
+        return data
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching data from API: {e}")
         return None
-    
-def load_to_bigquery(rows, table_id):
-    full_table_id = f"{PROJECT_ID}.{DATASET_ID}.{table_id}"
-    table_ref = client.dataset(DATASET_ID).table(table_id)
-    schema = [
-        bigquery.SchemaField('currency_id', 'STRING', mode='NULLABLE'),
-        bigquery.SchemaField('price_usd', 'FLOAT', mode='NULLABLE'),
-        bigquery.SchemaField('ingestion_time', 'TIMESTAMP', mode='NULLABLE')
-    ]
+
+def load_to_bigquery(raw_data):
+    logging.info("Starting data load to BigQuery...")
+    dataset_ref = client.dataset(DATASET_ID)
+    table_ref = dataset_ref.table(RAW_TABLE_ID)
+
+    try:
+        client.get_dataset(dataset_ref)
+        logging.info(f"Dataset {PROJECT_ID}.{DATASET_ID} already exists.")
+    except exceptions.NotFound:
+        dataset = bigquery.Dataset(dataset_ref)
+        client.create_dataset(dataset)
+        logging.info(f"Dataset {PROJECT_ID}.{DATASET_ID} created.")
+    except Exception as e:
+        logging.error(f"An error occurred while creating or checking for dataset existence: {e}")
+        raise RuntimeError("BigQuery dataset operation failed.")
 
     try:
         client.get_table(table_ref)
-        logging.info(f"Table {full_table_id} already exists.")
-    except Exception:
+        logging.info(f"Table {PROJECT_ID}.{DATASET_ID}.{RAW_TABLE_ID} already exists.")
+    except exceptions.NotFound:
+        # Define the schema for the table
+        schema = [
+            bigquery.SchemaField("currency_id", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("price_usd", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("market_cap_usd", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("vol_24hr_usd", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("change_24hr_usd", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("ingestion_time", "TIMESTAMP", mode="NULLABLE"),
+        ]
         table = bigquery.Table(table_ref, schema=schema)
-        client.create_table(table)
-        logging.info(f"Table {full_table_id} created.")
-
-    ingestion_time = bigquery.job.QueryJob(query='SELECT CURRENT_TIMESTAMP()').result().to_dataframe().iloc[0, 0]
-
-    for row in rows:
-        row['ingestion_time'] = ingestion_time
-    logging.info(f"Loading {len(rows)} rows into {full_table_id}")
-    errors = client.insert_rows_json(table_ref, rows)
-
-    if not errors:
-        logging.info("Data loaded successfully.")
-    else:
-        logging.error(f"Encountered errors while inserting rows: {errors}")
-        raise RuntimeError("BigQuery load failed.")
+        
+        try:
+            client.create_table(table)
+            logging.info(f"Table {PROJECT_ID}.{DATASET_ID}.{RAW_TABLE_ID} created.")
+        except exceptions.Conflict:
+            logging.warning(f"Table {PROJECT_ID}.{DATASET_ID}.{RAW_TABLE_ID} already existed but wasn't found on the first check.")
+    except Exception as e:
+        logging.error(f"An error occurred while creating or checking for table existence: {e}")
+        raise RuntimeError("BigQuery table operation failed.")
+        
+    rows_to_insert = []
+    ingestion_time = datetime.now()
     
+    for currency_id, prices in raw_data.items():
+        row = {
+            "currency_id": currency_id,
+            "price_usd": prices.get("usd"),
+            "market_cap_usd": prices.get("usd_market_cap"),
+            "vol_24hr_usd": prices.get("usd_24h_vol"),
+            "change_24hr_usd": prices.get("usd_24h_change"),
+            "ingestion_time": ingestion_time.isoformat()
+        }
+        rows_to_insert.append(row)
+    
+    if rows_to_insert:
+        try:
+            errors = client.insert_rows_json(table_ref, rows_to_insert)
+            if errors:
+                logging.error(f"Encountered errors while inserting rows: {errors}")
+                raise RuntimeError("BigQuery insertion failed.")
+            else:
+                logging.info(f"{len(rows_to_insert)} rows successfully loaded to BigQuery table '{RAW_TABLE_ID}'.")
+        except Exception as e:
+            logging.error(f"An error occurred during BigQuery load: {e}")
+            raise RuntimeError("BigQuery insertion failed.")
+
 def transform_data(sql_file_path):
     logging.info("Starting data transformation...")
 
@@ -100,14 +136,38 @@ def transform_data(sql_file_path):
         raise RuntimeError("BigQuery transformation failed.")
     
 if __name__ == "__main__":
-    api_endpoint = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd'
+    cryptocurrency_ids = [
+        "bitcoin", "ethereum", "tether", "binancecoin", "solana", "xrp", 
+        "cardano", "dogecoin", "shiba-inu", "avalanche-2", "polkadot", 
+        "litecoin", "chainlink", "tron", "polygon", "bitcoin-cash", "uniswap", 
+        "wrapped-bitcoin", "stellar", "monero", "ethereum-classic", "cosmos", 
+        "filecoin", "internet-computer", "optimism"
+    ]
+    
+    ids_string = ",".join(cryptocurrency_ids)
+
+    api_endpoint = (
+        f'https://api.coingecko.com/api/v3/simple/price?ids={ids_string}'
+        '&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true'
+        '&include_24hr_change=true'
+    )
     
     try:
+        # Step 1: Fetch data from the API
         raw_data = fetch_api_data(api_endpoint)
-        if raw_data:
-            load_to_bigquery(raw_data, RAW_TABLE_ID)
-            transform_data(TRANSFORMATION_SQL_PATH)
-        else:
-            logging.warning("Pipeline failed. No data to process.")
-    except Exception as e:
-        logging.critical(f"Pipeline terminated due to a critical error: {e}")
+        if not raw_data:
+            logging.critical("Pipeline failed. No data to process.")
+            exit()
+
+        # Step 2: Load data into BigQuery
+        load_to_bigquery(raw_data)
+        time.sleep(10)  # Wait for data to be available for the next transformation
+
+        # Step 3: Transform the data in BigQuery
+        transform_data(TRANSFORMATION_SQL_PATH)
+
+        logging.info("Pipeline executed successfully.")
+
+    except RuntimeError as e:
+        # Catch exceptions raised by the load and transform functions
+        logging.critical(f"Pipeline execution failed: {e}")

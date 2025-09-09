@@ -13,6 +13,9 @@ WITH
 SELECT
   t1.currency_id,
   t1.price_usd,
+  t1.market_cap_usd,
+  t1.vol_24hr_usd,
+  t1.change_24hr_usd,
   t1.ingestion_time,
   t1.ingestion_date,
   t1.ingestion_hour,
@@ -23,6 +26,9 @@ FROM
     SELECT
       currency_id,
       price_usd,
+      market_cap_usd,
+      vol_24hr_usd,
+      change_24hr_usd,
       ingestion_time,
       CAST(ingestion_time AS DATE) AS ingestion_date,
       EXTRACT(HOUR FROM ingestion_time) AS ingestion_hour,
